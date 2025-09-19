@@ -2953,9 +2953,10 @@ class RSPStrategy:
                     # For paper trades, create a simplified record since the Trade model is basic
                     # Use RSP monitoring strike ID for trade identification
                     rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
+                    paper_order_id = f"paper_rsp_{rsp_strike_id}_{int(get_naive_ist_now().timestamp())}"
                     trade_record = Trade(
                         user_id=1,  # Default user for now
-                        order_id=None,  # No actual order for paper trades
+                        order_id=paper_order_id,  # Generate unique paper order ID
                         trade_id=f"rsp_{rsp_strike_id}",
                         tradingsymbol=trading_symbol,
                         instrument_token=instrument_token,
@@ -2978,6 +2979,7 @@ class RSPStrategy:
                         "success": True,
                         "is_paper": True,
                         "trade_id": trade_record.id,
+                        "order_id": paper_order_id,
                         "order_id": trade_record.trade_id,
                         "message": "Paper trade executed successfully"
                     }
@@ -3035,7 +3037,7 @@ class RSPStrategy:
                         rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
                         trade_record = Trade(
                             user_id=1,  # Default user for now
-                            order_id=None,  # Would need to create TradingOrder first for proper integration
+                            order_id=order_id,  # Use actual Kite order ID for live trades
                             trade_id=f"rsp_{rsp_strike_id}",
                             tradingsymbol=trading_symbol,
                             instrument_token=instrument_token,
