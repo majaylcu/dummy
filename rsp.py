@@ -2950,13 +2950,34 @@ class RSPStrategy:
                 
                 # Create paper trade record
                 with SessionLocal() as db:
-                    # For paper trades, create a simplified record since the Trade model is basic
+                    # For paper trades, create TradingOrder first, then Trade
+                    from trading_models import TradingOrder
+                    
                     # Use RSP monitoring strike ID for trade identification
                     rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
                     paper_order_id = f"paper_rsp_{rsp_strike_id}_{int(get_naive_ist_now().timestamp())}"
+                    
+                    # Create TradingOrder record for paper trade
+                    trading_order = TradingOrder(
+                        user_id=1,  # Default user for now
+                        order_id=paper_order_id,  # Paper order ID (string)
+                        tradingsymbol=trading_symbol,
+                        instrument_token=instrument_token,
+                        exchange=exchange,
+                        transaction_type="SELL",
+                        order_type="MARKET",
+                        product="MIS",
+                        quantity=quantity_units,
+                        status="COMPLETE",  # Paper trades are immediately complete
+                        placed_at=get_naive_ist_now(),
+                        is_manual=False
+                    )
+                    db.add(trading_order)
+                    db.flush()  # Get the auto-generated ID
+                    
                     trade_record = Trade(
                         user_id=1,  # Default user for now
-                        order_id=paper_order_id,  # Generate unique paper order ID
+                        order_id=trading_order.id,  # Use TradingOrder.id (integer) as foreign key
                         trade_id=f"rsp_{rsp_strike_id}",
                         tradingsymbol=trading_symbol,
                         instrument_token=instrument_token,
@@ -2974,13 +2995,14 @@ class RSPStrategy:
                     db.refresh(trade_record)
                     
                     logger.info(f"✅ Paper trade record created with ID: {trade_record.id}")
+                    logger.info(f"✅ Paper TradingOrder created with ID: {trading_order.id}, Paper Order ID: {paper_order_id}")
                     
                     return {
                         "success": True,
                         "is_paper": True,
                         "trade_id": trade_record.id,
                         "order_id": paper_order_id,
-                        "order_id": trade_record.trade_id,
+                        "trading_order_id": trading_order.id,
                         "message": "Paper trade executed successfully"
                     }
             
@@ -3033,11 +3055,31 @@ class RSPStrategy:
                     
                     # Create live trade record
                     with SessionLocal() as db:
+                        # First, create TradingOrder record
+                        from trading_models import TradingOrder
+                        
+                        trading_order = TradingOrder(
+                            user_id=1,  # Default user for now
+                            order_id=order_id,  # Kite order ID (string)
+                            tradingsymbol=trading_symbol,
+                            instrument_token=instrument_token,
+                            exchange=exchange,
+                            transaction_type="SELL",
+                            order_type="MARKET",
+                            product="MIS",
+                            quantity=filled_quantity,
+                            status=order_status,
+                            placed_at=get_naive_ist_now(),
+                            is_manual=False
+                        )
+                        db.add(trading_order)
+                        db.flush()  # Get the auto-generated ID
+                        
                         # Use RSP monitoring strike ID for trade identification
                         rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
                         trade_record = Trade(
                             user_id=1,  # Default user for now
-                            order_id=order_id,  # Use actual Kite order ID for live trades
+                            order_id=trading_order.id,  # Use TradingOrder.id (integer) as foreign key
                             trade_id=f"rsp_{rsp_strike_id}",
                             tradingsymbol=trading_symbol,
                             instrument_token=instrument_token,
@@ -3055,12 +3097,14 @@ class RSPStrategy:
                         db.refresh(trade_record)
                         
                         logger.info(f"✅ Live trade record created with ID: {trade_record.id}")
+                        logger.info(f"✅ TradingOrder created with ID: {trading_order.id}, Kite Order ID: {order_id}")
                         
                         return {
                             "success": True,
                             "is_paper": False,
                             "trade_id": trade_record.id,
                             "order_id": order_id,
+                            "trading_order_id": trading_order.id,
                             "order_status": order_status,
                             "filled_quantity": filled_quantity,
                             "average_price": average_price,
