@@ -1923,7 +1923,7 @@ class RSPStrategy:
                     open_sell_trade = db.query(Trade).filter(
                         Trade.instrument_token == instrument_token,
                         Trade.transaction_type == 'SELL',
-                        Trade.status.in_(['PENDING', 'OPEN', 'ACTIVE'])  # Consider various open status values
+                        Trade.status == 'open'  # Check for open status as defined in Trade model
                     ).first()
                     
                     if open_sell_trade:
@@ -1998,13 +1998,13 @@ class RSPStrategy:
                 
                 # Prepare trade data (simplified without stop loss)
                 trade_data = {
-                    'symbol': symbol,
+                    # 'tradingsymbol': symbol,
                     'strike': float(strike_record.strike),
                     'option_type': option_type,
                     'instrument_token': instrument_token,
                     'trading_symbol': trading_symbol,
                     'transaction_type': 'SELL',
-                    'entry_price': latest_price,
+                    'price': latest_price,
                     'quantity': config.quantity_lots,
                     'is_paper': config.is_paper,
                     'strategy_type': 'RSP',
@@ -2917,7 +2917,7 @@ class RSPStrategy:
             # Extract trade parameters
             trading_symbol = trade_data["trading_symbol"]
             instrument_token = trade_data["instrument_token"]
-            entry_price = trade_data["entry_price"]
+            entry_price = trade_data["price"]
             option_type = trade_data["option_type"]
             strike_price = trade_data["strike"]  # Fixed: use 'strike' not 'strike_price'
             quantity = trade_data["quantity"]
