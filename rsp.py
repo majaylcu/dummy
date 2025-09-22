@@ -1158,10 +1158,16 @@ class RSPStrategy:
         
         # OPTIMIZATION: Initialize strike cache once at start of monitoring
         await self._initialize_strike_cache(config.monitoring_id)
-        
+
+        # Wait 2 seconds after market open (9:15 AM) before starting price fetching
+        # This allows market data to stabilize and ensures clean price feeds
+        logger.info(f"⏰ Waiting 2 seconds after market open for {symbol} before starting price monitoring...")
+        await asyncio.sleep(2)
+        logger.info(f"🚀 Starting active price monitoring for {symbol}")
+
         last_lock_renewal = datetime.now()
         lock_renewal_interval = LOCK_TTL_SECONDS // 2  # Renew at half TTL
-        
+
         try:
             while self.is_running and not asyncio.current_task().cancelled():
                 # Check trading hours
@@ -2967,13 +2973,25 @@ class RSPStrategy:
                         transaction_type="SELL",
                         order_type="MARKET",
                         product="MIS",
-                        quantity=quantity_units,
+                        validity="DAY",
+                        quantity=quantity_units,  # Original order quantity
+                        pending_quantity=0,  # 0 because paper trade is immediately complete
+                        filled_quantity=quantity_units,  # Immediately filled for paper trades
                         status="COMPLETE",  # Paper trades are immediately complete
                         placed_at=get_naive_ist_now(),
+                        tag=f"RSP_Paper_{trade_data.get('monitoring_id', 'unknown')}",
                         is_manual=False
                     )
                     db.add(trading_order)
                     db.flush()  # Get the auto-generated ID
+                    
+                    # Use RSP monitoring strike ID for trade identification
+                    rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
+                    
+                    # Use Decimal for precise price calculations (like postcrossover)
+                    from decimal import Decimal
+                    entry_price_decimal = Decimal(str(entry_price))
+                    trade_value_decimal = Decimal(str(quantity_units * entry_price))
                     
                     trade_record = Trade(
                         user_id=1,  # Default user for now
@@ -2984,13 +3002,18 @@ class RSPStrategy:
                         exchange=exchange,
                         transaction_type="SELL",
                         quantity=quantity_units,
-                        price=entry_price,
-                        value=quantity_units * entry_price,
+                        price=entry_price_decimal,
+                        value=trade_value_decimal,
                         status="open",
                         trade_time=get_naive_ist_now(),
                         created_at=get_naive_ist_now()
                     )
                     db.add(trade_record)
+
+                    # Flush to ensure all changes are ready before commit
+                    db.flush()
+                    logger.info("🔄 Database flush completed")
+
                     db.commit()
                     db.refresh(trade_record)
                     
@@ -3067,9 +3090,13 @@ class RSPStrategy:
                             transaction_type="SELL",
                             order_type="MARKET",
                             product="MIS",
-                            quantity=filled_quantity,
-                            status=order_status,
+                            validity="DAY",
+                            quantity=quantity_units,  # Original order quantity
+                            pending_quantity=0,  # 0 because order is already complete
+                            filled_quantity=filled_quantity,  # Actual filled quantity
+                            status="COMPLETE",  # Order is already complete
                             placed_at=get_naive_ist_now(),
+                            tag=f"RSP_{trade_data.get('monitoring_id', 'unknown')}",
                             is_manual=False
                         )
                         db.add(trading_order)
@@ -3077,6 +3104,12 @@ class RSPStrategy:
                         
                         # Use RSP monitoring strike ID for trade identification
                         rsp_strike_id = trade_data.get("rsp_monitoring_strike_id", "unknown")
+                        
+                        # Use Decimal for precise price calculations (like postcrossover)
+                        from decimal import Decimal
+                        average_price_decimal = Decimal(str(average_price))
+                        trade_value_decimal = Decimal(str(filled_quantity * average_price))
+                        
                         trade_record = Trade(
                             user_id=1,  # Default user for now
                             order_id=trading_order.id,  # Use TradingOrder.id (integer) as foreign key
@@ -3086,13 +3119,14 @@ class RSPStrategy:
                             exchange=exchange,
                             transaction_type="SELL",
                             quantity=filled_quantity,
-                            price=average_price,
-                            value=filled_quantity * average_price,
+                            price=average_price_decimal,
+                            value=trade_value_decimal,
                             status="open",
                             trade_time=get_naive_ist_now(),
                             created_at=get_naive_ist_now()
                         )
                         db.add(trade_record)
+                        db.flush()
                         db.commit()
                         db.refresh(trade_record)
                         
