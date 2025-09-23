@@ -69,43 +69,43 @@ def is_trading_hours(timestamp: datetime = None) -> bool:
 
 def is_before_market_open(timestamp: datetime = None) -> bool:
     """
-    Check if current time is before market open (9:15 AM IST)
-    Returns True if before 9:15 AM on a weekday
+    Check if current time is before market open (9:15:10 AM IST)
+    Returns True if before 9:15:10 AM on a weekday
     """
     if timestamp is None:
         timestamp = get_naive_ist_now()
-    
+
     current_time = timestamp.time()
     current_weekday = timestamp.weekday()  # 0=Monday, 6=Sunday
-    
+
     # Only relevant for weekdays
     if current_weekday > 4:  # Weekend
         return False
-    
-    # Market opens at 9:15 AM
-    market_open_time = datetime.strptime("09:15", "%H:%M").time()
-    
+
+    # Market opens at 9:15:10 AM (10 seconds after official market open)
+    market_open_time = datetime.strptime("09:15:10", "%H:%M:%S").time()
+
     return current_time < market_open_time
 
 async def wait_for_market_open():
     """
-    Wait until market opens (9:15 AM IST) on weekdays
+    Wait until market opens (9:15:10 AM IST) on weekdays
     Returns immediately if already past market open or on weekends
     """
     current_time = get_naive_ist_now()
-    
+
     if not is_before_market_open(current_time):
         return  # Already past market open
-    
-    # Calculate time until 9:15 AM
-    market_open_time = datetime.strptime("09:15", "%H:%M").time()
+
+    # Calculate time until 9:15:10 AM
+    market_open_time = datetime.strptime("09:15:10", "%H:%M:%S").time()
     today_market_open = datetime.combine(current_time.date(), market_open_time)
-    
-    # If we're before 9:15 AM today
+
+    # If we're before 9:15:10 AM today
     time_to_wait = (today_market_open - current_time).total_seconds()
-    
+
     if time_to_wait > 0:
-        logger.info(f"⏰ Waiting {time_to_wait/60:.1f} minutes until market open (9:15 AM)...")
+        logger.info(f"⏰ Waiting {time_to_wait/60:.1f} minutes until market open (9:15:10 AM)...")
         await asyncio.sleep(time_to_wait)
         logger.info("🟢 Market open time reached - starting monitoring")
 
@@ -937,7 +937,7 @@ class RSPStrategy:
             # Step 3: Check if we need to wait for market open
             current_time = get_naive_ist_now()
             if is_before_market_open(current_time):
-                logger.info(f"🕘 Starting RSP monitoring for {symbol} before market open - will wait until 9:15 AM")
+                logger.info(f"🕘 Starting RSP monitoring for {symbol} before market open - will wait until 9:15:10 AM")
                 # Allow monitoring to start but it will wait for market open
             elif not is_trading_hours():
                 # After market hours or weekend - don't allow
@@ -946,7 +946,7 @@ class RSPStrategy:
                 return {
                     "success": False, 
                     "message": "Outside trading hours. Monitoring not started.",
-                    "trading_hours": "09:15-15:30 IST (Mon-Fri)",
+                    "trading_hours": "09:15:10-15:30 IST (Mon-Fri)",
                     "code": 400
                 }
             
@@ -1159,7 +1159,7 @@ class RSPStrategy:
         # OPTIMIZATION: Initialize strike cache once at start of monitoring
         await self._initialize_strike_cache(config.monitoring_id)
 
-        # Wait 2 seconds after market open (9:15 AM) before starting price fetching
+        # Wait 2 seconds after market open (9:15:10 AM) before starting price fetching
         # This allows market data to stabilize and ensures clean price feeds
         logger.info(f"⏰ Waiting 2 seconds after market open for {symbol} before starting price monitoring...")
         await asyncio.sleep(2)
@@ -1580,9 +1580,19 @@ class RSPStrategy:
                 logger.warning(f"⚠️ Unexpected case - using current ATM as fallback")
                 selected_strikes = [current_atm]
             
+            # Enhanced: Always add ATM±1 strikes for additional monitoring
+            atm_minus_1 = current_atm - strike_step
+            atm_plus_1 = current_atm + strike_step
+
+            # Add ATM±1 to the selected strikes
+            atm_adjacent_strikes = [atm_minus_1, current_atm, atm_plus_1]
+            selected_strikes.extend(atm_adjacent_strikes)
+
+            logger.info(f"🎯 Added ATM±1 strikes: ATM-1={atm_minus_1}, ATM={current_atm}, ATM+1={atm_plus_1}")
+
             # Remove duplicates and sort
             selected_strikes = sorted(list(set(selected_strikes)))
-            
+
             # Ensure all strikes are valid (positive and properly stepped)
             valid_strikes = []
             for strike in selected_strikes:
@@ -1590,8 +1600,9 @@ class RSPStrategy:
                     valid_strikes.append(strike)
                 else:
                     logger.warning(f"⚠️ Invalid strike {strike} (step: {strike_step}) - skipping")
-            
+
             logger.info(f"✅ Final selected strikes for {symbol}: {valid_strikes}")
+            logger.info(f"📊 Strike breakdown: RSP strikes + ATM±1 = {len(valid_strikes)} total strikes")
             return valid_strikes
             
         except Exception as e:
@@ -2191,12 +2202,219 @@ class RSPStrategy:
                     symbol, strike_record, target_option, target_price,
                     new_reentry_point, new_stop_loss, event_type, config
                 )
+
+                # Enhanced: Trigger ATM refresh after meetingpoint/crossover events
+                try:
+                    await self._refresh_atm_strikes_if_needed(symbol, monitoring_id, config)
+                except Exception as refresh_error:
+                    logger.error(f"❌ Error during ATM refresh for {symbol}: {refresh_error}")
             else:
                 logger.error(f"❌ Failed to update levels for {symbol} strike {strike_price}")
                 
         except Exception as e:
             logger.error(f"❌ Error handling crossover/meetingpoint update for {symbol} strike {strike_record.strike}: {e}")
-    
+
+    async def _refresh_atm_strikes_if_needed(self, symbol: str, monitoring_id: str, config: RSPConfig):
+        """
+        Enhanced: Refresh ATM±1 strikes after meetingpoint/crossover events
+        Adds new ATM±1 strikes based on current market price, skips if already exist
+        """
+        try:
+            logger.info(f"🔄 Checking ATM refresh for {symbol} after event...")
+
+            # Step 1: Get current market price
+            current_price = await self._get_current_underlying_price(symbol)
+            if not current_price:
+                logger.warning(f"⚠️ Could not get current price for {symbol}, skipping ATM refresh")
+                return
+
+            # Step 2: Calculate new ATM
+            strike_step = self._get_strike_interval(symbol)
+            new_atm = round(current_price / strike_step) * strike_step
+
+            logger.info(f"📊 Current price: {current_price}, New ATM: {new_atm}, Strike step: {strike_step}")
+
+            # Step 3: Generate new ATM±1 strikes
+            new_strikes = {
+                'ATM-1': new_atm - strike_step,
+                'ATM': new_atm,
+                'ATM+1': new_atm + strike_step
+            }
+
+            logger.info(f"🎯 Checking ATM±1 strikes: {new_strikes}")
+
+            # Step 4: Check and add strikes that don't exist
+            db = SessionLocal()
+            added_count = 0
+
+            try:
+                for strike_type, strike_price in new_strikes.items():
+                    # Check if strike already exists in current monitoring session
+                    existing_strike = db.query(RSPMonitoringStrike).filter(
+                        RSPMonitoringStrike.monitoring_id == monitoring_id,
+                        RSPMonitoringStrike.strike == float(strike_price)
+                    ).first()
+
+                    if existing_strike:
+                        logger.info(f"⚠️ Strike {strike_price} ({strike_type}) already exists, skipping")
+                        continue
+
+                    # Strike doesn't exist → Add it
+                    success = await self._add_new_strike_to_monitoring(
+                        db, monitoring_id, strike_price, strike_type, symbol, config
+                    )
+
+                    if success:
+                        added_count += 1
+                        logger.info(f"✅ Added new {strike_type} strike {strike_price}")
+
+                # Refresh cache if new strikes were added
+                if added_count > 0:
+                    await self._refresh_strike_cache_if_needed(monitoring_id)
+                    logger.info(f"🔄 Added {added_count} new ATM±1 strikes, cache refreshed")
+                else:
+                    logger.info(f"ℹ️ No new ATM±1 strikes needed - all already exist")
+
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"❌ Error refreshing ATM strikes for {symbol}: {e}")
+
+    async def _get_current_underlying_price(self, symbol: str) -> Optional[float]:
+        """Get current underlying price from Redis"""
+        try:
+            price_data = await self.get_latest_price_from_redis(symbol)
+            if price_data and 'last_price' in price_data:
+                return float(price_data['last_price'])
+
+            logger.warning(f"⚠️ No price data found for {symbol}")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Error getting current price for {symbol}: {e}")
+            return None
+
+    async def _add_new_strike_to_monitoring(self, db, monitoring_id: str, strike_price: float,
+                                          strike_type: str, symbol: str, config: RSPConfig) -> bool:
+        """Add a new strike to monitoring following the same flow as existing strikes"""
+        try:
+            # Get CE/PE tokens and symbols from options_pairs table
+            ce_token, ce_symbol, pe_token, pe_symbol = await self._get_option_details(
+                symbol, strike_price, db
+            )
+
+            if not ce_token or not pe_token:
+                logger.error(f"❌ Failed to get option details for strike {strike_price}")
+                return False
+
+            # Get current option prices
+            ce_price = await self._get_option_price_from_redis(ce_token, ce_symbol)
+            pe_price = await self._get_option_price_from_redis(pe_token, pe_symbol)
+
+            # Calculate reentry points and stop-loss levels (using existing logic)
+            threshold_percentage = config.monitoring_threshold
+            ce_reentry = ce_price * (1 - threshold_percentage / 100) if ce_price else None  # Subtract threshold
+            pe_reentry = pe_price * (1 - threshold_percentage / 100) if pe_price else None  # Subtract threshold
+
+            # Calculate stop-loss (add threshold percentage)
+            ce_stoploss = ce_price * (1 + threshold_percentage / 100) if ce_price else None
+            pe_stoploss = pe_price * (1 + threshold_percentage / 100) if pe_price else None
+
+            # Get current underlying price for baseline
+            current_underlying_price = await self._get_current_underlying_price(symbol)
+
+            # Determine distance from ATM
+            current_atm = config.current_atm_strike if hasattr(config, 'current_atm_strike') else strike_price
+            distance_from_atm = int((strike_price - current_atm) / (50 if symbol == 'NIFTY' else 100))
+            is_atm = (strike_price == current_atm)
+
+            # Create new RSPMonitoringStrike record
+            new_strike = RSPMonitoringStrike(
+                monitoring_id=monitoring_id,
+                strike=strike_price,
+                distance_from_atm=distance_from_atm,
+                is_atm=is_atm,
+                ce_token=ce_token,
+                ce_symbol=ce_symbol,
+                ce_price=ce_price or 0,
+                ce_reentry_point=ce_reentry,
+                ce_stoploss=ce_stoploss,
+                pe_token=pe_token,
+                pe_symbol=pe_symbol,
+                pe_price=pe_price or 0,
+                pe_reentry_point=pe_reentry,
+                pe_stoploss=pe_stoploss,
+                baseline_price_915=current_underlying_price,
+                monitoring_threshold=config.monitoring_threshold,
+                stop_loss=config.stop_loss,
+                monitoring_status='PENDING',
+                last_price=current_underlying_price,
+                last_price_updated=datetime.now(),
+                ce_last_updated=datetime.now() if ce_price else None,
+                pe_last_updated=datetime.now() if pe_price else None
+            )
+
+            # Add to database
+            db.add(new_strike)
+            db.commit()
+
+            logger.info(f"✅ Successfully added new {strike_type} strike {strike_price} to monitoring")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error adding new strike {strike_price} to monitoring: {e}")
+            db.rollback()
+            return False
+
+    async def _get_option_details(self, symbol: str, strike_price: float, db) -> tuple:
+        """Get CE/PE token and symbol details from options_pairs table"""
+        try:
+            from backend.models.instruments import OptionsPair
+
+            # Get today's expiry options
+            today = datetime.now().date()
+
+            option_pair = db.query(OptionsPair).filter(
+                OptionsPair.underlying_symbol == symbol,
+                OptionsPair.strike == strike_price,
+                OptionsPair.expiry_date >= today
+            ).order_by(OptionsPair.expiry_date.asc()).first()
+
+            if not option_pair:
+                logger.error(f"❌ No option pair found for {symbol} strike {strike_price}")
+                return None, None, None, None
+
+            return (
+                option_pair.ce_token,
+                option_pair.ce_symbol,
+                option_pair.pe_token,
+                option_pair.pe_symbol
+            )
+
+        except Exception as e:
+            logger.error(f"❌ Error getting option details for {symbol} strike {strike_price}: {e}")
+            return None, None, None, None
+
+    async def _get_option_price_from_redis(self, token: str, symbol: str) -> Optional[float]:
+        """Get option price from Redis cache"""
+        try:
+            if not self.redis_client:
+                logger.warning(f"⚠️ Redis client not available for price lookup: {symbol}")
+                return None
+
+            price_data = await self.redis_client.hget("live_prices", token)
+            if price_data:
+                price_info = json.loads(price_data)
+                return float(price_info.get('last_price', 0))
+
+            logger.warning(f"⚠️ No price data found for option {symbol} (token: {token})")
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ Error getting option price for {symbol}: {e}")
+            return None
+
     async def _send_trade_entry_notification(self, symbol: str, strike_record: RSPMonitoringStrike,
                                            option_type: str, entry_price: float,
                                            trading_symbol: str, config: RSPConfig):
@@ -2488,21 +2706,21 @@ class RSPStrategy:
                     ce_price = None
                     pe_price = None
                     
-                    # Check current time vs market open (9:15 AM)
+                    # Check current time vs market open (9:15:10 AM)
                     current_time = datetime.now().time()
-                    market_open = datetime.strptime("09:15", "%H:%M").time()
-                    
+                    market_open = datetime.strptime("09:15:10", "%H:%M:%S").time()
+
                     if current_time < market_open:
-                        # Started before 9:15 AM - Wait until exactly 9:15 AM
+                        # Started before 9:15:10 AM - Wait until exactly 9:15:10 AM
                         now = datetime.now()
                         market_open_today = datetime.combine(now.date(), market_open)
                         wait_seconds = (market_open_today - now).total_seconds()
                         
                         if wait_seconds > 0:
-                            logger.info(f"⏰ Waiting {wait_seconds:.0f} seconds until market open (9:15 AM) for price fetching...")
+                            logger.info(f"⏰ Waiting {wait_seconds:.0f} seconds until market open (9:15:10 AM) for price fetching...")
                             await asyncio.sleep(wait_seconds)
-                        
-                        # Now fetch live prices at exactly 9:15 AM
+
+                        # Now fetch live prices at exactly 9:15:10 AM
                         ce_tick_data = await self.get_latest_tick(options_data["ce_instrument_token"])
                         if ce_tick_data:
                             ce_price = ce_tick_data.get('last_price') or ce_tick_data.get('ltp')
@@ -2511,10 +2729,10 @@ class RSPStrategy:
                         if pe_tick_data:
                             pe_price = pe_tick_data.get('last_price') or pe_tick_data.get('ltp')
                             
-                        logger.info(f"🕘 Fetched live prices at 9:15 AM - CE: ₹{ce_price}, PE: ₹{pe_price}")
-                        
+                        logger.info(f"🕘 Fetched live prices at 9:15:10 AM - CE: ₹{ce_price}, PE: ₹{pe_price}")
+
                     else:
-                        # Started after 9:15 AM - Get historical 9:15 AM price from stream
+                        # Started after 9:15:10 AM - Get historical 9:15 AM price from stream
                         logger.info(f"🕘 Started after market open, fetching historical 9:15 AM prices from stream...")
                         
                         # Try to get 9:15 AM price first
@@ -2580,6 +2798,16 @@ class RSPStrategy:
                     
                     logger.warning(f"⚠️ Using fallback symbols for strike {strike_price}: {ce_symbol}, {pe_symbol}")
                 
+                # Enhanced: Check if strike already exists in this monitoring session
+                existing_strike = db.query(RSPMonitoringStrike).filter(
+                    RSPMonitoringStrike.monitoring_id == monitoring_id,
+                    RSPMonitoringStrike.strike == float(strike_price)
+                ).first()
+
+                if existing_strike:
+                    logger.info(f"⚠️ Strike {strike_price} already exists in monitoring session, skipping")
+                    continue
+
                 # Create strike record
                 strike_record = RSPMonitoringStrike(
                     monitoring_id=monitoring_id,
@@ -3251,7 +3479,7 @@ async def start_monitoring(
                     preview_strikes = sorted([float(strike) for strike in parsed_strikes])
                     logger.info(f"🕘 Before market open - using manual strikes: {preview_strikes}")
                 else:
-                    logger.info(f"🕘 Before market open - strike calculation will be done after 9:15 AM")
+                    logger.info(f"🕘 Before market open - strike calculation will be done after 9:15:10 AM")
                     preview_strikes = []  # Empty strikes - will be calculated after market open
             else:
                 # During/after market hours - calculate normally
@@ -3307,8 +3535,8 @@ async def start_monitoring(
         if result["success"]:
             # Determine message based on timing
             if is_before_market_open():
-                message = f"RSP monitoring queued for {symbol} - will start at 9:15 AM"
-                timing_info = "Monitoring will begin automatically when market opens at 9:15 AM"
+                message = f"RSP monitoring queued for {symbol} - will start at 9:15:10 AM"
+                timing_info = "Monitoring will begin automatically when market opens at 9:15:10 AM"
             else:
                 message = f"Started RSP monitoring for {symbol}"
                 timing_info = "Monitoring is now active"
