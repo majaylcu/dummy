@@ -1894,20 +1894,28 @@ class RSPStrategy:
             if latest_price <= reentry_point:
                 logger.info(f"🎯 Entry point breach detected for {symbol} {strike_record.strike} {option_type}")
                 logger.info(f"   Latest Price: ₹{latest_price} <= Entry Point: ₹{reentry_point}")
-                
+
+                # CONDITION 1A+: For ATM and adjacent strikes, check if meetingpoint/crossover happened first
+                if await self._is_atm_or_adjacent_strike(symbol, strike_record, config):
+                    if not await self._has_meetingpoint_crossover_occurred(symbol, strike_record, config):
+                        logger.info(f"⚠️ ATM/Adjacent strike {strike_record.strike} - waiting for meetingpoint/crossover before entry")
+                        return
+                    else:
+                        logger.info(f"✅ ATM/Adjacent strike {strike_record.strike} - meetingpoint/crossover occurred, proceeding with entry")
+
                 # Get instrument token based on option type
-                instrument_token = (int(strike_record.ce_token) if option_type == 'CE' 
+                instrument_token = (int(strike_record.ce_token) if option_type == 'CE'
                                   else int(strike_record.pe_token))
-                trading_symbol = (strike_record.ce_symbol if option_type == 'CE' 
+                trading_symbol = (strike_record.ce_symbol if option_type == 'CE'
                                 else strike_record.pe_symbol)
-                
+
                 # CONDITION 1B: Check if no open SELL trade exists for this instrument
                 if await self._check_no_open_sell_trade_optimized(instrument_token):
                     logger.info(f"✅ No open SELL trade found for {trading_symbol} - proceeding with trade entry")
-                    
+
                     # Execute SELL trade
                     await self._execute_sell_trade_optimized(
-                        symbol, strike_record, option_type, latest_price, 
+                        symbol, strike_record, option_type, latest_price,
                         instrument_token, trading_symbol, config
                     )
                 else:
@@ -2196,7 +2204,10 @@ class RSPStrategy:
                 logger.info(f"✅ Level update complete for {symbol} strike {strike_price} {target_option}")
                 logger.info(f"   Reentry: ₹{old_reentry} → ₹{new_reentry_point}")
                 logger.info(f"   Stop Loss: ₹{old_stoploss} → ₹{new_stop_loss}")
-                
+
+                # Update monitoring status to enable ATM/adjacent strikes for entry
+                await self._update_strike_monitoring_status(monitoring_id, strike_record, 'MONITORING')
+
                 # Send notification
                 await self._send_crossover_meetingpoint_notification(
                     symbol, strike_record, target_option, target_price,
@@ -2295,6 +2306,93 @@ class RSPStrategy:
             logger.error(f"❌ Error getting current price for {symbol}: {e}")
             return None
 
+    async def _is_atm_or_adjacent_strike(self, symbol: str, strike_record: RSPMonitoringStrike, config: RSPConfig) -> bool:
+        """Check if this strike is ATM, ATM-1, or ATM+1"""
+        try:
+            # Get current ATM strike
+            current_atm = await self._get_current_atm_strike_price(symbol)
+            if current_atm is None:
+                logger.warning(f"⚠️ Could not determine current ATM for {symbol}")
+                return False
+
+            strike_price = float(strike_record.strike)
+            strike_step = self._get_strike_interval(symbol)
+
+            # Check if this is ATM, ATM-1, or ATM+1
+            atm_minus_1 = current_atm - strike_step
+            atm_plus_1 = current_atm + strike_step
+
+            is_atm_or_adjacent = strike_price in [atm_minus_1, current_atm, atm_plus_1]
+
+            if is_atm_or_adjacent:
+                strike_type = "ATM" if strike_price == current_atm else ("ATM-1" if strike_price == atm_minus_1 else "ATM+1")
+                logger.debug(f"📊 Strike {strike_price} is {strike_type} (ATM: {current_atm})")
+
+            return is_atm_or_adjacent
+
+        except Exception as e:
+            logger.error(f"❌ Error checking if strike is ATM/adjacent for {symbol}: {e}")
+            return False
+
+    async def _has_meetingpoint_crossover_occurred(self, symbol: str, strike_record: RSPMonitoringStrike, config: RSPConfig) -> bool:
+        """Check if a meetingpoint or crossover has occurred for this monitoring session"""
+        try:
+            # Check the monitoring status of this strike
+            # If it's moved from PENDING to MONITORING or beyond, it means meetingpoint/crossover occurred
+            monitoring_status = strike_record.monitoring_status
+
+            # Strikes start as PENDING, move to MONITORING after meetingpoint/crossover
+            has_event_occurred = monitoring_status in ['MONITORING', 'ALERTED', 'COMPLETED']
+
+            if has_event_occurred:
+                logger.debug(f"✅ Strike {strike_record.strike} has event status: {monitoring_status}")
+            else:
+                logger.debug(f"⏳ Strike {strike_record.strike} still pending (status: {monitoring_status})")
+
+            return has_event_occurred
+
+        except Exception as e:
+            logger.error(f"❌ Error checking meetingpoint/crossover status for {symbol}: {e}")
+            return False
+
+    async def _update_strike_monitoring_status(self, monitoring_id: str, strike_record: RSPMonitoringStrike, new_status: str):
+        """Update monitoring status for a strike in both database and cache"""
+        try:
+            db = SessionLocal()
+            try:
+                # Update database
+                db_record = db.query(RSPMonitoringStrike).filter(
+                    RSPMonitoringStrike.monitoring_id == monitoring_id,
+                    RSPMonitoringStrike.strike == strike_record.strike
+                ).first()
+
+                if db_record:
+                    old_status = db_record.monitoring_status
+                    db_record.monitoring_status = new_status
+                    db_record.updated_at = datetime.now()
+                    db.commit()
+
+                    # Update in-memory cache
+                    if monitoring_id in self.strike_cache:
+                        for cached_record in self.strike_cache[monitoring_id]:
+                            if cached_record.strike == strike_record.strike:
+                                cached_record.monitoring_status = new_status
+                                cached_record.updated_at = datetime.now()
+                                break
+
+                    logger.info(f"✅ Updated strike {strike_record.strike} status: {old_status} → {new_status}")
+                else:
+                    logger.error(f"❌ Strike record not found in DB for status update: {strike_record.strike}")
+
+            except Exception as e:
+                db.rollback()
+                logger.error(f"❌ Database update failed for strike status: {e}")
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"❌ Error updating strike monitoring status: {e}")
+
     async def _add_new_strike_to_monitoring(self, db, monitoring_id: str, strike_price: float,
                                           strike_type: str, symbol: str, config: RSPConfig) -> bool:
         """Add a new strike to monitoring following the same flow as existing strikes"""
@@ -2348,7 +2446,7 @@ class RSPStrategy:
                 baseline_price_915=current_underlying_price,
                 monitoring_threshold=config.monitoring_threshold,
                 stop_loss=config.stop_loss,
-                monitoring_status='PENDING',
+                monitoring_status='MONITORING',  # Set to MONITORING since strikes added after meetingpoint/crossover
                 last_price=current_underlying_price,
                 last_price_updated=datetime.now(),
                 ce_last_updated=datetime.now() if ce_price else None,
@@ -2359,7 +2457,7 @@ class RSPStrategy:
             db.add(new_strike)
             db.commit()
 
-            logger.info(f"✅ Successfully added new {strike_type} strike {strike_price} to monitoring")
+            logger.info(f"✅ Successfully added new {strike_type} strike {strike_price} with MONITORING status (can trade immediately)")
             return True
 
         except Exception as e:
