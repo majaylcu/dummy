@@ -281,17 +281,15 @@ class RSPTradeMonitor:
             close_transaction_type = "BUY"
             
             order_params = {
-                "variety": "regular",
+                "variety": self.kite_service.kite.VARIETY_REGULAR,
                 "exchange": trade.exchange,
                 "tradingsymbol": trade.tradingsymbol,
-                "transaction_type": close_transaction_type,
+                "transaction_type": self.kite_service.kite.TRANSACTION_TYPE_BUY,
                 "quantity": trade.quantity,
-                "product": "MIS",
-                "order_type": "MARKET",
-                "validity": "DAY",
-                "disclosed_quantity": 0,
-                "trigger_price": 0,
-                "tag": f"RSP_SessionEnd_{trade.id}"
+                "product": self.kite_service.kite.PRODUCT_MIS,
+                "order_type": self.kite_service.kite.ORDER_TYPE_MARKET,
+                "validity": self.kite_service.kite.VALIDITY_DAY
+                # Removed extra parameters to match successful entry order format
             }
             
             order_result = self.kite_service.place_order(**order_params)
@@ -628,48 +626,48 @@ class RSPTradeMonitor:
             # RSP trades are SELL trades, so we always place BUY orders to close
             close_transaction_type = "BUY"
             
-            # Place market order to close position
+            # Place market order to close position - using same format as successful entry orders
+            if not self.kite_service or not self.kite_service.kite:
+                raise ValueError("Kite service not available")
+
             order_params = {
-                "variety": "regular",
+                "variety": self.kite_service.kite.VARIETY_REGULAR,
                 "exchange": trade.exchange,
                 "tradingsymbol": trade.tradingsymbol,
-                "transaction_type": close_transaction_type,
+                "transaction_type": self.kite_service.kite.TRANSACTION_TYPE_BUY,  # Using kite constants
                 "quantity": trade.quantity,
-                "product": "MIS",
-                "order_type": "MARKET",
-                "validity": "DAY",
-                "disclosed_quantity": 0,
-                "trigger_price": 0,
-                "tag": f"RSP_SL_Close_{trade.id}"
+                "product": self.kite_service.kite.PRODUCT_MIS,
+                "order_type": self.kite_service.kite.ORDER_TYPE_MARKET,
+                "validity": self.kite_service.kite.VALIDITY_DAY
+                # Removed: disclosed_quantity, trigger_price, and tag to match entry order format
             }
             
             # Execute close order with error handling
             order_success = False
             order_error = None
             
-            if self.kite_service:
-                try:
-                    order_result = self.kite_service.place_order(**order_params)
-                    logger.info(f"✅ Stop loss close order placed: {order_result}")
+            # Use self.kite_service instead of global import for consistency
+            if self.kite_service and self.kite_service.kite:
+                # Try placing order with retry mechanism for timeout issues
+                order_result = await self._place_exit_order_with_retry(order_params, trade, current_price, stop_loss_price)
+
+                if order_result:
                     order_success = True
-                    
+                    logger.info(f"✅ Stop loss close order placed: {order_result}")
+
                     # Update trade status in database
                     await self._update_trade_status(trade.id, "closed", "stop_loss")
-                    
+
                     # Send success notification
                     await self._send_stop_loss_notification(trade, current_price, stop_loss_price)
-                    
-                except Exception as order_error_exc:
-                    order_error = str(order_error_exc)
-                    logger.error(f"❌ Order placement failed: {order_error}")
-                    
-                    # Handle specific AMO error or other trading errors
-                    if "AMO" in order_error or "After Market Order" in order_error:
-                        logger.warning("⚠️ AMO restriction detected - marking for manual close")
-                    
+                else:
+                    # All retry attempts failed
+                    order_error = "All retry attempts failed for market exit order"
+                    logger.error(f"❌ {order_error}")
+
                     # Update trade status to require manual intervention
                     await self._update_trade_status(trade.id, "closed", "manual_close_required")
-                    
+
                     # Send manual close notification
                     await self._send_manual_close_notification(trade, current_price, stop_loss_price, order_error)
                     
@@ -696,17 +694,102 @@ class RSPTradeMonitor:
             
         except Exception as e:
             logger.error(f"❌ Critical error closing trade {trade.id}: {e}")
-            
+
             # Even on critical error, remove from monitoring to prevent loops
             self.monitored_trades.discard(trade.id)
             self.trade_crossover_events.pop(trade.id, None)
-            
+
             # Try to send error notification
             try:
                 await self._send_manual_close_notification(trade, current_price, stop_loss_price, str(e))
             except Exception as notify_error:
                 logger.error(f"❌ Failed to send error notification: {notify_error}")
-    
+
+    async def _place_exit_order_with_retry(self, order_params: dict, trade: Trade, current_price: float, stop_loss_price: float):
+        """
+        Place market exit order with retry mechanism for timeout issues
+        Returns order result on success, None on failure
+        """
+        max_retries = 3
+        base_delay = 1.5  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔄 Attempt {attempt + 1}/{max_retries}: Placing market exit order for trade {trade.id}")
+
+                start_time = asyncio.get_event_loop().time()
+                order_result = self.kite_service.place_order(**order_params)
+                execution_time = asyncio.get_event_loop().time() - start_time
+
+                logger.info(f"✅ Market exit order succeeded in {execution_time:.2f}s on attempt {attempt + 1}")
+                return order_result
+
+            except Exception as e:
+                execution_time = asyncio.get_event_loop().time() - start_time if 'start_time' in locals() else 0
+                error_str = str(e)
+
+                logger.warning(f"❌ Attempt {attempt + 1} failed after {execution_time:.2f}s: {error_str}")
+
+                # Check if this is a timeout error
+                is_timeout_error = (
+                    'Read timed out' in error_str or
+                    'timeout' in error_str.lower() or
+                    'Connection timeout' in error_str or
+                    'HTTPSConnectionPool' in error_str
+                )
+
+                # Check if this is a retryable error
+                is_retryable_error = (
+                    is_timeout_error or
+                    'Connection error' in error_str or
+                    'ConnectionError' in error_str or
+                    'HTTP 500' in error_str or
+                    'HTTP 502' in error_str or
+                    'HTTP 503' in error_str or
+                    'HTTP 504' in error_str
+                )
+
+                # Don't retry on certain types of errors
+                non_retryable_patterns = [
+                    'Invalid API key',
+                    'Token expired',
+                    'Insufficient funds',
+                    'Invalid instrument',
+                    'Invalid order parameters',
+                    'AMO',
+                    'After Market Order',
+                    'Market is closed',
+                    'Trading not allowed'
+                ]
+
+                is_non_retryable = any(pattern in error_str for pattern in non_retryable_patterns)
+
+                if is_non_retryable:
+                    logger.error(f"🚫 Non-retryable error for trade {trade.id}: {error_str}")
+                    # Send immediate manual close notification for non-retryable errors
+                    await self._send_manual_close_notification(trade, current_price, stop_loss_price, error_str)
+                    return None
+
+                if attempt == max_retries - 1:
+                    # Last attempt failed - send notification for all retry failures
+                    logger.error(f"🔴 All {max_retries} attempts failed for market exit order (trade {trade.id})")
+                    final_error = f"All {max_retries} retry attempts failed. Last error: {error_str}"
+                    await self._send_manual_close_notification(trade, current_price, stop_loss_price, final_error)
+                    return None
+
+                if is_retryable_error:
+                    # Calculate delay with exponential backoff for timeout errors
+                    delay = base_delay * (1.5 ** attempt)
+                    logger.info(f"⏳ Timeout detected, retrying in {delay:.1f} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    # Non-timeout error, shorter delay
+                    delay = 0.5
+                    logger.info(f"⏳ Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+
+        return None
+
     async def _update_trade_status(self, trade_id: int, status: str, close_reason: str):
         """
         Update trade status in database
